@@ -1,5 +1,6 @@
 #include <SPI.h>
 #include<WiFi.h>
+#include <AWS_IOT.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include "portalhtml.h"
@@ -49,15 +50,15 @@ const byte txAddr[6] = "00001";
 int counter =0;
 
 //Gateway name
-String gate = "GateWay1";
+String gate = "GID1000001";
 
 //*********SSID and Pass for AP**************//
 const char* ssidAPConfig = "adminesp";
 const char* passAPConfig = "adminesp";
 
 //*********AWS Credentials*************//
-char HOST_ADDRESS[]="a15adm0vrco7b4-ats.iot.us-west-2.amazonaws.com";
-char CLIENT_ID[]= "thing1Policy";
+char HOST_ADDRESS[]="a2app4wsx7d5u1-ats.iot.ap-southeast-2.amazonaws.com";
+char CLIENT_ID[]= "iot_policy";
 
 
 //**********softAPconfig Timer*************//
@@ -68,7 +69,7 @@ unsigned long APInterval = 90000;
 char rxBuff[MAX_MESSAGE_LEN] ="";
 char ackbuff[MAX_MESSAGE_LEN] ="";
 char ackPayload[] = "Success";
-const char MESSAGE_BODY[] = "{\"state\":{\"desired\":{\"gate\":\"%s\",\"device\":%s,\"temp\":%d}}}";
+const char MESSAGE_BODY[] = "{\"state\":{\"desired\":{\"gatewayId\":\"%s\",\"deviceId\":\"%s\",\"deviceTemperature\":%d}}}";
 char messagePayload[WIFI_MESSAGE];
 //char ack[MAX_MESSAGE_LEN] ="";
 bool isAPConnected = true;
@@ -86,7 +87,6 @@ void mySubCallBackHandler (char *topicName, int payloadLen, char *payLoad)
 void IRAM_ATTR ISR_int(){
      APTimer = millis();
      detachInterrupt(digitalPinToInterrupt(intPin));
-     vTaskSuspend( xHandle );
      gatewayConfig=1;
   }
 
@@ -100,22 +100,24 @@ void setup() {
   EEPROM.begin(512);
   radio.begin();
   radio.setChannel(CHANNEL);
+  //radio.setDataRate(RF24_1MBPS);
   radio.setDataRate(RF24_250KBPS);
+  radio.setRetries(5,15);
   radio.setAutoAck(true);
   radio.enableAckPayload();
   radio.enableDynamicPayloads();        
   Serial.println(radio.isChipConnected() ? "connected" : "not connected");
-  radio.setPALevel(RF24_PA_MIN);
+  radio.setPALevel(RF24_PA_MAX);
   radio.openWritingPipe(txAddr);        // Both radios listen on the same pipes by default, and switch when writing
   radio.openReadingPipe(1,rxAddr);
   radio.startListening(); 
-  reconnectWiFi();
-  //delay(5000);
+  //reconnectWiFi();
   attachInterrupt(digitalPinToInterrupt(intPin),ISR_int,CHANGE);
+  delay(5000);
   xTaskCreatePinnedToCore(
     TaskSend
     ,  "TaskSendNRF"   // A name just for humans
-    ,  4096  // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  2048  // This stack size can be checked & adjusted by reading the Stack Highwater
     ,  NULL
     ,  2  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
     ,  &xHandle 
@@ -125,51 +127,16 @@ void setup() {
 void loop() {
 
     if(gatewayConfig){
+          vTaskSuspend( xHandle );
           Serial.println("interruptGenerated");
           handleWebform();
-          vTaskResume(xHandle);
       }
       gatewayConfig=0;
-  /*if(startConfig==1){
-      Serial.println("interruptGenerated");
-      handleWebform();
-    }*/
-    
-}
-
-
-void TaskSend(void *pvParameters)  // This is a task.
-{
-  (void) pvParameters;
-   
-  for (;;) // A Task shall never return or exit.
-  { 
-          
-   if ( radio.available()) {
-    if(rxBuff!=""){
-         strcpy(rxBuff,"");
-         Serial.println("buffercleared");
-      }
-        radio.read(&rxBuff, sizeof(rxBuff));
-        //Serial.println(sizeof(buff));
-        Serial.println(rxBuff);
-        Serial.println(sizeof(rxBuff));
-        DeserializationError error = deserializeJson(doc,rxBuff);
-     if (error) {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.c_str());
-        return;
-     } 
-        const char* deviceId= doc["d"];
-        int sensor = doc["s"];
-        String devCat = "DEVICE0" + String(deviceId);
-        Serial.printf("sensor = %d\n",sensor);
-        Serial.println(devCat);
-        snprintf(messagePayload,WIFI_MESSAGE,MESSAGE_BODY,gate.c_str(),devCat.c_str(),sensor);
-        Serial.println(messagePayload);
-        if(sizeof(messagePayload)>0){
+      
+           if(strstr(messagePayload,"state")!=NULL){      
            if(WiFi.status()==WL_CONNECTED){
-               int code = hornbill.publish(IOT_TOPIC,messagePayload);
+
+               int code = awsClient.publish(IOT_TOPIC,messagePayload);
                Serial.printf("message published %d",counter++);
         Serial.println(code); 
         switch(code){
@@ -223,23 +190,73 @@ void TaskSend(void *pvParameters)  // This is a task.
   /** A timeout occurred while waiting for the TLS handshake to complete. */
               case -13:
                   Serial.println("NETWORK_DISCONNECTED_ERROR");
-                  hornbill.connect(HOST_ADDRESS,CLIENT_ID);
+                  awsClient.connect(HOST_ADDRESS,CLIENT_ID);
                   break;
               default:
                   Serial.println("NETWORK_ERROR");
-                  //hornbill.connect(HOST_ADDRESS,CLIENT_ID);    
+                  //awsClient.connect(HOST_ADDRESS,CLIENT_ID);    
           }
-               }else{
+            
+           }else{
                  reconnectWiFi();
-                 reconnectMQTT()
-              }
-        }
+                 reconnectMQTT();
+              }  
+               Serial.println(messagePayload);
+            if(strstr(messagePayload,"state")!=NULL){
+             memset(messagePayload,0,sizeof(messagePayload));
+              Serial.println(messagePayload);
+            Serial.println("messagePayload buffer cleared");
+           }
+               }
+               
+        vTaskDelay(1000);
+
+}
+
+
+void TaskSend(void *pvParameters)  // This is a task.
+{
+  (void) pvParameters;
+   
+  for (;;) // A Task shall never return or exit.
+  { 
+        if ( radio.available()) {
+        if(rxBuff!=""){
+         strcpy(rxBuff,"");
+         Serial.println("buffercleared");
+      }
+        radio.read(&rxBuff, sizeof(rxBuff));
+        //Serial.println(sizeof(buff));
+        Serial.println(rxBuff);
+        Serial.println(sizeof(rxBuff));
+        DeserializationError error = deserializeJson(doc,rxBuff);
+     if (error) {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.c_str());
+        return;
+     } 
+        const char* deviceId= doc["d"];
+        int sensorVal = doc["s"];
+        String devCat = "DID1000" + String(deviceId);
+        Serial.printf("sensor = %d\n",sensorVal);
+        Serial.println(devCat);
+        WiFi.mode(WIFI_MODE_STA);
+        String mac = WiFi.macAddress();
+        snprintf(messagePayload,WIFI_MESSAGE,MESSAGE_BODY,mac.c_str(),devCat.c_str(),sensorVal);
+        Serial.println(messagePayload);
+        
+  /*if(startConfig==1){
+      Serial.println("interruptGenerated");
+      handleWebform();
+    }*/
+    
+}
+          
     vTaskDelay(5);
   }
     vTaskDelay(1000);
   }
   
-}
 
 
 //****************************Connect to WiFi****************************//
@@ -270,6 +287,8 @@ void reconnectWiFi(){
 
 //****************************handleWebForm****************************//
 void handleWebform(){ 
+      Serial.println(WiFi.disconnect()? "disconnected":"not Disconnected");
+      Serial.println("Entered here");
       WiFi.mode(WIFI_AP);
       delay(100);
       Serial.println(WiFi.softAP(ssidAPConfig,passAPConfig) ? "Configuring softAP" : "kya yaar not connected");
@@ -278,10 +297,8 @@ void handleWebform(){
       Serial.println(WiFi.softAPIP());
       server.begin();
       server.on("/", handle1);
-      server.on("/node", handle2);
-      server.on("/nodeConfig", handle3); 
       server.onNotFound(handleNotFound);
-      while(millis()-APTimer<= APInterval) {
+      while(isAPConnected && millis()-APTimer<= APInterval) {
        server.handleClient();  
         }
        Serial.println("Server disconnected");
@@ -295,24 +312,19 @@ void handleWebform(){
 void handle1(){
    Serial.println("handle 1 begin");
   if(server.args()>0){
-       if(server.hasArg("ssid")&&server.hasArg("passkey")&&server.hasArg("sensor_select")&&server.hasArg("sensor_list")){
+    Serial.println(server.args());
+            for(int i=0; i<=server.args();i++){
+            Serial.println(String(server.argName(i))+'\t' + String(server.arg(i)));
+        } 
+       if(server.hasArg("ssid")&&server.hasArg("passkey")&&server.hasArg("sensor_select")){
           /*for (int i = 0 ; i < EEPROM.length() ; i++) {
             EEPROM.write(i, 0);
           }*/
           Serial.println("handle 1 over");
-          ROMwrite(String(server.arg("ssid")),String(server.arg("passkey")),String(server.arg("sensor_select")),String(server.arg("sensor_list")));
-          handle2();
-        }
-        else if(server.hasArg("node")){       
-            int pos = 82;
-            Serial.println(server.args());
-            for(int i=0; i<=server.args();i++){
-            Serial.println(String(server.argName(i))+'\t' + String(server.arg(i)));
-            ROMwriteNode(String(server.arg(i)),pos);
-            pos+=6;
+          ROMwrite(String(server.arg("ssid")),String(server.arg("passkey")),String(server.arg("sensor_select")));
+          isAPConnected =false;    
         } 
-            isAPConnected =false;  
-         }    
+                  
     }else{
           int n = WiFi.scanNetworks();
           int indices[n];     
@@ -341,7 +353,6 @@ void handle1(){
          webString+= FPSTR(HTTPLABLE2);
          webString+= FPSTR(HTTPLABLE3);
          webString+= FPSTR(HTTPNODESEL);
-         webString+= FPSTR(HHTTPDELAY);
          webString+= FPSTR(HTTPSUBMIT);
          webString+= FPSTR(HTTPCLOSEFORM);
          webString+= FPSTR(HTTPSCRIPT);
@@ -368,15 +379,13 @@ void handleNotFound()
   
 
 //----------Write to ROM-----------//
-void ROMwrite(String s, String p, String id,String delays){
+void ROMwrite(String s, String p, String id){
  s+=";";
  write_EEPROM(s,0);
  p+=";";
  write_EEPROM(p,22);
  id+=";";
  write_EEPROM(id,52);
- delays+=";";
- write_EEPROM(delays,62);
  EEPROM.commit();   
 }
 
@@ -428,14 +437,14 @@ int getRSSIasQuality(int RSSI) {
 void reconnectMQTT(){
   Serial.println("Maintain Connection");
   if(WiFi.status()==WL_CONNECTED){
-    int connError = hornbill.connect(HOST_ADDRESS,CLIENT_ID);
+    int connError = awsClient.connect(HOST_ADDRESS,CLIENT_ID);
     Serial.println(connError);
     if(connError== 0)
     {
         Serial.println("Connected to AWS");
         delay(1000);
 
-        if(0==hornbill.subscribe(TOPIC_NAME,mySubCallBackHandler))
+        if(0==awsClient.subscribe(TOPIC_NAME,mySubCallBackHandler))
         {
             Serial.println("Subscribe Successfull");
         }
